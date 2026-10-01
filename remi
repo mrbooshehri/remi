@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+PROGRAM=${0##*/}
+PRIMARY_PROFILE_DIR=${REMMINA_PROFILE_DIR:-${XDG_DATA_HOME:-"$HOME/.local/share"}/remmina}
+
+declare -a PROFILE_FILES=()
+declare -a PROFILE_NAMES=()
+declare -a PROFILE_LABELS=()
+declare -a PROFILE_GROUPS=()
+declare -a PROFILE_PROTOCOLS=()
+declare -a PROFILE_SERVERS=()
+declare -a PROFILE_USERS=()
+
+die() {
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage: $PROGRAM [command]
+
+Browse and manage Remmina connection profiles from a terminal.
+
+Commands:
+  pick                 Open the interactive fzf picker (default)
+  list                 List all discovered profiles
+  connect [PROFILE]    Pick a profile, or connect to PROFILE
+  add                  Create a profile interactively
+  edit [PROFILE]       Pick a profile, or edit PROFILE in \$VISUAL/\$EDITOR
+  remove [PROFILE]     Pick a profile, or remove PROFILE
+  help                 Show this help
+
+Picker keys:
+  Enter   connect                 ctrl-a   add
+  ctrl-e  edit selected profile   ctrl-d   remove selected profile
+
+Environment:
+  REMMINA_PROFILE_DIR  Directory used for new profiles and searched first
+  VISUAL / EDITOR      Terminal editor used by the edit command
+EOF
+}
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+profile_value() {
+    local file=$1 wanted=$2 key value
+    while IFS='=' read -r key value || [[ -n ${key:-} ]]; do
+        if [[ $key == "$wanted" ]]; then
+            printf '%s' "$value"
+            return 0
+        fi
+    done < "$file"
+    return 1
+}
+
+one_line() {
+    local value=$1
+    value=${value//$'\t'/ }
+    value=${value//$'\r'/ }
+    value=${value//$'\n'/ }
+    printf '%s' "$value"
+}
+
+discover_profiles() {
+    local -a roots=()
+    local root file canonical
+    local -A seen_roots=() seen_files=()
+
+    roots+=("$PRIMARY_PROFILE_DIR")
+    roots+=(
+        "${XDG_DATA_HOME:-"$HOME/.local/share"}/remmina"
+        "$HOME/.remmina"
+        "$HOME/.var/app/org.remmina.Remmina/data/remmina"
+        "$HOME/snap/remmina/current/.local/share/remmina"
+    )
+
+    PROFILE_FILES=()
+    PROFILE_NAMES=()
+    PROFILE_LABELS=()
+    PROFILE_GROUPS=()
+    PROFILE_PROTOCOLS=()
+    PROFILE_SERVERS=()
+    PROFILE_USERS=()
+
+    for root in "${roots[@]}"; do
+        [[ -d $root ]] || continue
+        canonical=$(realpath -m -- "$root")
+        [[ -z ${seen_roots[$canonical]+x} ]] || continue
+        seen_roots[$canonical]=1
+
+        while IFS= read -r -d '' file; do
+            canonical=$(realpath -m -- "$file")
+            [[ -z ${seen_files[$canonical]+x} ]] || continue
+            seen_files[$canonical]=1
+            PROFILE_FILES+=("$file")
+            PROFILE_NAMES+=("$(profile_value "$file" name || basename "$file" .remmina)")
+            PROFILE_LABELS+=("$(profile_value "$file" label || profile_value "$file" name || basename "$file" .remmina)")
+            PROFILE_GROUPS+=("$(profile_value "$file" group || true)")
+            PROFILE_PROTOCOLS+=("$(profile_value "$file" protocol || printf '?')")
+            PROFILE_SERVERS+=("$(profile_value "$file" server || printf '?')")
+            PROFILE_USERS+=("$(profile_value "$file" username || true)")
+        done < <(find "$root" -maxdepth 1 -type f -name '*.remmina' -print0 2>/dev/null | sort -z)
+    done
+}
+
+profile_rows() {
+    local i target
+    for i in "${!PROFILE_FILES[@]}"; do
+        target=${PROFILE_SERVERS[$i]}
+        [[ -z ${PROFILE_USERS[$i]} ]] || target="${PROFILE_USERS[$i]}@$target"
+        printf 'profile\t%s\t%-18s  %-28s  %-6s  %s\n' \
+            "$i" \
+            "$(one_line "${PROFILE_GROUPS[$i]:--}")" \
+            "$(one_line "${PROFILE_LABELS[$i]}")" \
+            "$(one_line "${PROFILE_PROTOCOLS[$i]}")" \
+            "$(one_line "$target")"
+    done
+}
+
+select_profile() {
+    local prompt=${1:-'Remmina > '} selection
+    discover_profiles
+    ((${#PROFILE_FILES[@]})) || die "no Remmina profiles found; run '$PROGRAM add' first"
+
+    selection=$(profile_rows | fzf \
+        --delimiter=$'\t' \
+        --with-nth=3 \
+        --no-multi \
+        --height=80% \
+        --layout=reverse \
+        --border \
+        --prompt="$prompt") || return 1
+    printf '%s' "${PROFILE_FILES[$(cut -f2 <<< "$selection")]}"
+}
+
+resolve_profile() {
+    local query=${1:-} i match=''
+    [[ -n $query ]] || return 1
+
+    if [[ -f $query ]]; then
+        realpath -- "$query"
+        return 0
+    fi
+
+    discover_profiles
+    for i in "${!PROFILE_FILES[@]}"; do
+        if [[ ${PROFILE_NAMES[$i]} == "$query" || ${PROFILE_FILES[$i]##*/} == "$query" ]]; then
+            [[ -z $match ]] || die "more than one profile matches '$query'; use its full path"
+            match=${PROFILE_FILES[$i]}
+        fi
+    done
+    [[ -n $match ]] || die "profile not found: $query"
+    printf '%s' "$match"
+}
+
+choose_or_resolve() {
+    if (($#)); then
+        resolve_profile "$1"
+    else
+        select_profile
+    fi
+}
+
+prompt_required() {
+    local label=$1 value
+    while :; do
+        read -r -p "$label: " value || return 1
+        [[ $value != *$'\n'* && $value != *$'\r'* ]] || continue
+        if [[ -n $value ]]; then
+            printf '%s' "$value"
+            return 0
+        fi
+        printf 'A value is required.\n' >&2
+    done
+}
+
+prompt_optional() {
+    local label=$1 value
+    read -r -p "$label: " value || return 1
+    [[ $value != *$'\n'* && $value != *$'\r'* ]] || die "value cannot contain a newline"
+    printf '%s' "$value"
+}
+
+ini_escape() {
+    local value=$1
+    value=${value//\\/\\\\}
+    value=${value//$'\t'/\\t}
+    printf '%s' "$value"
+}
+
+slugify() {
+    local value=${1,,}
+    value=${value//[^[:alnum:]._-]/-}
+    while [[ $value == *--* ]]; do value=${value//--/-}; done
+    value=${value#-}
+    value=${value%-}
+    printf '%s' "${value:-connection}"
+}
+
+add_profile() {
+    local name group protocol server username slug destination temporary suffix=1
+
+    printf 'Create a Remmina profile (the password will be requested securely by Remmina).\n'
+    name=$(prompt_required 'Name') || return 1
+    group=$(prompt_optional 'Group (optional)') || return 1
+    read -r -p 'Protocol [RDP/VNC/SSH/SPICE] (RDP): ' protocol || return 1
+    protocol=${protocol:-RDP}
+    protocol=${protocol^^}
+    case $protocol in
+        RDP|VNC|SSH|SPICE) ;;
+        *) die "unsupported protocol: $protocol (use RDP, VNC, SSH, or SPICE)" ;;
+    esac
+    server=$(prompt_required 'Server (host or host:port)') || return 1
+    username=$(prompt_optional 'Username (optional)') || return 1
+
+    mkdir -p -- "$PRIMARY_PROFILE_DIR"
+    chmod 700 -- "$PRIMARY_PROFILE_DIR" 2>/dev/null || true
+    slug=$(slugify "$name")
+    destination="$PRIMARY_PROFILE_DIR/$slug.remmina"
+    while [[ -e $destination ]]; do
+        destination="$PRIMARY_PROFILE_DIR/$slug-$suffix.remmina"
+        ((++suffix))
+    done
+
+    umask 077
+    temporary=$(mktemp "$PRIMARY_PROFILE_DIR/.${slug}.XXXXXX")
+    {
+        printf '[remmina]\n'
+        printf 'name=%s\n' "$(ini_escape "$name")"
+        printf 'group=%s\n' "$(ini_escape "$group")"
+        printf 'protocol=%s\n' "$protocol"
+        printf 'server=%s\n' "$(ini_escape "$server")"
+        printf 'username=%s\n' "$(ini_escape "$username")"
+    } > "$temporary"
+    mv -- "$temporary" "$destination"
+    printf 'Created %s\n' "$destination"
+}
+
+validate_profile() {
+    local file=$1
+    grep -qx '\[remmina\]' "$file" || die "edited file has no [remmina] section; original left unchanged"
+    profile_value "$file" name >/dev/null || die "edited file has no name; original left unchanged"
+    profile_value "$file" protocol >/dev/null || die "edited file has no protocol; original left unchanged"
+    profile_value "$file" server >/dev/null || die "edited file has no server; original left unchanged"
+}
+
+edit_profile() {
+    local file=$1 temporary editor_setting
+    local -a editor_command
+    editor_setting=${VISUAL:-${EDITOR:-vi}}
+    read -r -a editor_command <<< "$editor_setting"
+    require_command "${editor_command[0]}"
+
+    temporary=$(mktemp "${TMPDIR:-/tmp}/remi-edit.XXXXXX.remmina")
+    trap 'rm -f -- "${temporary:-}"' RETURN
+    cp -- "$file" "$temporary"
+    "${editor_command[@]}" "$temporary"
+    validate_profile "$temporary"
+    chmod --reference="$file" "$temporary" 2>/dev/null || chmod 600 "$temporary"
+    mv -- "$temporary" "$file"
+    trap - RETURN
+    printf 'Updated %s\n' "$file"
+}
+
+remove_profile() {
+    local file=$1 answer
+    read -r -p "Remove '$(profile_value "$file" name || basename "$file")'? [y/N] " answer || return 1
+    [[ $answer == [yY] || $answer == [yY][eE][sS] ]] || { printf 'Cancelled.\n'; return 0; }
+
+    # A broken desktop session can leave gio waiting indefinitely; keep the
+    # terminal tool usable and fall back to a direct removal in that case.
+    if command -v gio >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1 \
+        && timeout 3s gio trash -- "$file" 2>/dev/null; then
+        printf 'Moved to trash: %s\n' "$file"
+    else
+        rm -- "$file"
+        printf 'Removed permanently: %s\n' "$file"
+    fi
+}
+
+connect_profile() {
+    require_command remmina
+    remmina -c "$1"
+}
+
+list_profiles() {
+    local i target
+    discover_profiles
+    ((${#PROFILE_FILES[@]})) || return 0
+    printf '%-18s  %-28s  %-8s  %-32s  %s\n' GROUP LABEL PROTOCOL TARGET FILE
+    for i in "${!PROFILE_FILES[@]}"; do
+        target=${PROFILE_SERVERS[$i]}
+        [[ -z ${PROFILE_USERS[$i]} ]] || target="${PROFILE_USERS[$i]}@$target"
+        printf '%-18s  %-28s  %-8s  %-32s  %s\n' \
+            "$(one_line "${PROFILE_GROUPS[$i]:--}")" \
+            "$(one_line "${PROFILE_LABELS[$i]}")" \
+            "$(one_line "${PROFILE_PROTOCOLS[$i]}")" \
+            "$(one_line "$target")" \
+            "${PROFILE_FILES[$i]}"
+    done
+}
+
+picker() {
+    local output key row index file
+    require_command fzf
+
+    while :; do
+        discover_profiles
+        output=$(
+            {
+                printf 'add\t-1\t+  Add a new profile\n'
+                profile_rows
+            } | fzf \
+                --delimiter=$'\t' \
+                --with-nth=3 \
+                --no-multi \
+                --height=80% \
+                --layout=reverse \
+                --border \
+                --prompt='Remmina > ' \
+                --header='enter: connect  ctrl-a: add  ctrl-e: edit  ctrl-d: remove  esc: quit' \
+                --expect=enter,ctrl-a,ctrl-e,ctrl-d
+        ) || return 0
+
+        key=${output%%$'\n'*}
+        row=${output#*$'\n'}
+        [[ $row != "$output" ]] || row=''
+
+        if [[ $key == ctrl-a || $row == add$'\t'* ]]; then
+            add_profile
+            read -r -p 'Press Enter to return to the picker...' _ || true
+            continue
+        fi
+        [[ -n $row ]] || continue
+        index=$(cut -f2 <<< "$row")
+        [[ $index =~ ^[0-9]+$ && -n ${PROFILE_FILES[$index]+x} ]] || continue
+        file=${PROFILE_FILES[$index]}
+
+        case $key in
+            ctrl-e)
+                edit_profile "$file"
+                ;;
+            ctrl-d)
+                remove_profile "$file"
+                ;;
+            enter|'')
+                connect_profile "$file"
+                ;;
+        esac
+    done
+}
+
+main() {
+    local command=${1:-pick} file
+    (($# == 0)) || shift
+    case $command in
+        pick)
+            (($# == 0)) || die "pick takes no arguments"
+            picker
+            ;;
+        list|ls)
+            (($# == 0)) || die "list takes no arguments"
+            list_profiles
+            ;;
+        connect|open)
+            (($# <= 1)) || die "connect takes at most one profile"
+            file=$(choose_or_resolve "$@") || return 0
+            connect_profile "$file"
+            ;;
+        add|new)
+            (($# == 0)) || die "add takes no arguments"
+            add_profile
+            ;;
+        edit)
+            (($# <= 1)) || die "edit takes at most one profile"
+            file=$(choose_or_resolve "$@") || return 0
+            edit_profile "$file"
+            ;;
+        remove|rm|delete)
+            (($# <= 1)) || die "remove takes at most one profile"
+            file=$(choose_or_resolve "$@") || return 0
+            remove_profile "$file"
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        *)
+            die "unknown command '$command' (try '$PROGRAM help')"
+            ;;
+    esac
+}
+
+main "$@"
